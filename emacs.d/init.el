@@ -17,6 +17,14 @@
 (setq user-emacs-directory
       (file-name-directory (or load-file-name buffer-file-name)))
 
+;; ── Elisp ロードパス設定（自作: lisp/ ＆ 外部: site-lisp/）──
+(let ((lisp-dir (expand-file-name "lisp" user-emacs-directory))
+      (site-lisp-dir (expand-file-name "site-lisp" user-emacs-directory)))
+  (when (file-directory-p lisp-dir)
+    (add-to-list 'load-path lisp-dir))
+  (when (file-directory-p site-lisp-dir)
+    (add-to-list 'load-path site-lisp-dir)))
+
 ;; ポータブル環境用：.authinfo をホームディレクトリではなく .emacs.d の中に配置する設定
 (setq auth-sources
       (list (expand-file-name ".authinfo" user-emacs-directory)
@@ -251,6 +259,25 @@ USB側に残っている前回の状態を引き継ぐためのものです。"
   "ユーザーが再読み込みを拒否した時点のファイル更新日時。
 次回外部でファイルが再度変更されるまで、同一の変更に対する確認を抑制します。")
 
+(defun my/buffer-matches-file-p ()
+  "未変更バッファの内容がディスク上のファイルと同一なら non-nil。
+大きいファイル（2MB超）は比較しない。"
+  (let ((file buffer-file-name)
+        (cs   buffer-file-coding-system)
+        (buf  (current-buffer)))
+    (and file
+         (file-readable-p file)
+         (< (or (file-attribute-size (file-attributes file)) most-positive-fixnum)
+            2000000)
+         (with-temp-buffer
+           (let ((coding-system-for-read cs))
+             (insert-file-contents file))
+           (let ((disk (buffer-substring-no-properties (point-min) (point-max))))
+             (with-current-buffer buf
+               (save-restriction
+                 (widen)
+                 (string= disk (buffer-substring-no-properties (point-min) (point-max))))))))))
+
 (defun my/auto-revert-handler-around (orig-fun &rest args)
   "外部変更検知時に確認プロンプトを出し、拒否されたら次の変更までスキップする。"
   (if (and buffer-file-name
@@ -267,6 +294,10 @@ USB側に残っている前回の状態を引き継ぐためのものです。"
           nil)
          ;; ミニバッファ入力中はユーザーの邪魔をしない
          ((minibuffer-window-active-p (selected-window))
+          nil)
+         ;; 内容がディスクと同一なら日時の誤差だけなので、黙って記録し直す
+         ((and (not (buffer-modified-p)) (my/buffer-matches-file-p))
+          (set-visited-file-modtime)
           nil)
          ;; それ以外ならユーザーに確認
          (t
@@ -864,13 +895,14 @@ USB等のポータブルドライブへの直接書き込みで終了時に固�
 
 ;; point1: space-mark を有効にしつつ、styleから「spaces（半角）」を除外。
 ;; これにより「全角スペース」と「TAB」だけがwhitespaceの管理対象になります。
-(setq whitespace-style '(face tabs tab-mark spaces space-mark trailing))
+(setq whitespace-style '(face tabs tab-mark space-mark newline newline-mark))
 
 ;; point2: 可視化する文字のマッピング
 ;; 半角スペースはマッピング自体を空にして完全に非表示（透明）にします。
 (setq whitespace-display-mappings
-      '((space-mark ?\u3000 [?\u25a1] [?_ ?_])       ;; 全角スペース → 「□」
-        (tab-mark   ?\t     [?\u00BB ?\t] [?\\ ?\t]))) ;; TAB → 「»」
+      '((space-mark   ?\u3000 [?\u25a1] [?_ ?_])       ;; 全角スペース → 「□」
+        (tab-mark     ?\t     [?\u00BB ?\t] [?\\ ?\t]) ;; TAB → 「»」
+        (newline-mark ?\n     [?\u21b5 ?\n] [?$ ?\n])))  ;; 改行 → 「↵」
 
 (global-whitespace-mode 1)
 
@@ -892,8 +924,9 @@ USB等のポータブルドライブへの直接書き込みで終了時に固�
          ;; 背景よりわずかに明るい/暗い程度の、主張しない色を作る
          (tab-color   (color-lighten-name bg (if dark 18 -10)))
          (space-color (color-lighten-name bg (if dark 12 -6))))
-    (dolist (spec `((whitespace-tab   . ,tab-color)
-                     (whitespace-space . ,space-color)))
+  (dolist (spec `((whitespace-tab     . ,tab-color)
+                (whitespace-space   . ,space-color)
+                (whitespace-newline . ,space-color)))
       (set-face-attribute (car spec) nil
                            :background 'unspecified   ; 灰色の箱をやめる
                            :foreground (cdr spec)
@@ -1145,114 +1178,156 @@ C-u を前置するか、Ctrl+Shift+' を押すとこのファイルのピンを
           (message "外部プログラムで開きました: %s" (file-name-nondirectory file)))
       (message "有効なファイルではありません: %s" file))))
 
-;; デフォルトの m3u8/m3u プレイリストファイルパスをここで設定してください
-;; 例: "c:/Music/mylist.m3u8"
-;; nil にすると毎回ファイル選択ダイアログが開きます
-(defvar my/m3u8-default-playlist
-  (expand-file-name "TOROID/PPx/userdata/l_mp3filelist.m3u8"
-                     (or (getenv "APPDATA") "c:/"))
-  "my/m3u8-search-and-play で使うデフォルトのプレイリストファイルパス。
-%APPDATA% (環境変数) を起点に解決する。nil にすると毎回ダイアログで選択します。")
+;; =====================================================================
+;; Everything (es.exe) 連携：全ドライブ 音楽・動画リアルタイム検索・再生
+;; =====================================================================
 
-(defun my/m3u8-normalize-path (raw)
-  "Windows の バックスラッシュ パスを Emacs 用スラッシュに変換し BOM・空白を除去する。"
-  (let* ((s (string-trim raw))
-         (s (replace-regexp-in-string "\\`[\xef\xbb\xbf\xff\xfe]+" "" s))
-         (s (replace-regexp-in-string "\\\\" "/" s)))
-    s))
+(defcustom my/media-es-program
+  (or (let ((p "C:/Users/gocho/AppData/Local/Programs/emacs_portable/bin/es.exe"))
+        (when (file-exists-p p) p))
+      (let ((p "C:/Program Files/PPX/tools/es.exe"))
+        (when (file-exists-p p) p))
+      (executable-find "es.exe")
+      "es.exe")
+  "Path to the Everything CLI (es.exe) executable."
+  :type 'file
+  :group 'convenience)
 
-(defun my/m3u8-parse-entries (playlist-file)
-  "m3u/m3u8 ファイルを読み込み (表示名 . パス) のリストを返す。
-EXTINF 行があれば曲名を、なければファイル名を表示名にする。
-Windows バックスラッシュパスは自動でスラッシュに変換する。"
-  (let ((base-dir (file-name-directory (expand-file-name playlist-file)))
-        entries
-        current-title)
-    (with-temp-buffer
-      (let ((coding-system-for-read 'utf-8-with-signature))
-        (insert-file-contents playlist-file))
-      (goto-char (point-min))
-      (while (not (eobp))
-        (let ((line (my/m3u8-normalize-path
-                     (or (thing-at-point 'line t) ""))))
-          (cond
-           ((string-match "^#EXTINF:[^,]*,\\(.*\\)$" line)
-            (setq current-title (string-trim (match-string 1 line))))
-           ((string-prefix-p "#" line) nil)
-           ((string-empty-p line) nil)
-           (t
-            (let* ((fpath (if (string-match-p "^[a-zA-Z]:/" line)
-                              line
-                            (expand-file-name line base-dir)))
-                   (label (or current-title (file-name-nondirectory fpath))))
-              (push (cons label fpath) entries)
-              (setq current-title nil)))))
-        (forward-line 1)))
-    (nreverse entries)))
+(defcustom my/media-extensions
+  '("mp3" "flac" "wav" "m4a" "aac" "ogg" "opus" "wma"
+    "mp4" "mkv" "avi" "wmv" "webm" "ts" "mov")
+  "List of media file extensions (audio and video) to search."
+  :type '(repeat string)
+  :group 'convenience)
 
-(defun my/m3u8-candidates (entries)
-  "ENTRIES から補完用の (表示文字列 . パス) alist を作る。"
-  (let ((seen (make-hash-table :test 'equal)))
-    (mapcar
-     (lambda (entry)
-       (let* ((title (car entry))
-              (path (cdr entry))
-              (base-label (if (string-empty-p title)
-                              (file-name-nondirectory path)
-                            title))
-              (count (1+ (gethash base-label seen 0)))
-              (label (if (= count 1)
-                         base-label
-                       (format "%s  <%d>" base-label count)))
-              (candidate (format "%s    %s" label path)))
-         (puthash base-label count seen)
-         (cons candidate path)))
-     entries)))
+(defvar my/media--candidates-cache nil
+  "In-memory cached list of formatted completion candidates.")
 
-(defun my/m3u8-search-and-play ()
-  "m3u/m3u8 プレイリストの曲を検索して外部プレイヤーで再生する。
-固定パスは my/m3u8-default-playlist で設定。
-C-u 付きで実行するとダイアログでファイルを選び直せます。"
+(defvar my/media-cache-file
+  (expand-file-name "media-list.cache"
+                    (expand-file-name ".cache" user-emacs-directory))
+  "File path to persist media list cache across Emacs sessions.")
+
+(defun my/media-clear-cache ()
+  "Clear in-memory and on-disk media files cache."
   (interactive)
-  (let* ((playlist
-          (if (and my/m3u8-default-playlist
-                   (not current-prefix-arg)
-                   (file-exists-p my/m3u8-default-playlist))
-              my/m3u8-default-playlist
-            (read-file-name
-             "プレイリストを選択 (.m3u/.m3u8): "
-             (if my/m3u8-default-playlist
-                 (file-name-directory my/m3u8-default-playlist)
-               "c:/")
-             nil t nil
-             (lambda (f)
-               (or (file-directory-p f)
-                   (string-match-p "\\.m3u8?$" f))))))
-         (entries (my/m3u8-parse-entries playlist)))
-    (if (null entries)
-        (message "曲が見つかりませんでした: %s" playlist)
-      (let* ((candidates
-              (my/m3u8-candidates entries))
-             (chosen
-              (let ((orderless-matching-styles
-                     '(orderless-literal orderless-regexp orderless-migemo)))
-                (completing-read
-                 (format "[%s] 曲を選択 (%d 曲): "
-                         (file-name-nondirectory playlist)
-                         (length entries))
-                 candidates nil t)))
-             (fpath (alist-get chosen candidates nil nil #'string=)))
+  (setq my/media--candidates-cache nil)
+  (when (file-exists-p my/media-cache-file)
+    (ignore-errors (delete-file my/media-cache-file)))
+  (message "[Media] キャッシュを消去しました。"))
+
+(defun my/media-fetch-files ()
+  "Fetch all media files across all drives using `my/media-es-program`."
+  (unless (and my/media-es-program (file-exists-p my/media-es-program))
+    (user-error "es.exe が見つかりません: %s" my/media-es-program))
+  (let* ((ext-query (concat "ext:" (string-join my/media-extensions ";")))
+         (temp-file (make-temp-file "media_es_" nil ".txt"))
+         (args (list ext-query "-export-txt" (subst-char-in-string ?/ ?\\ temp-file) "-utf8-bom"))
+         (lines nil))
+    (unwind-protect
+        (progn
+          (apply #'process-file my/media-es-program nil nil nil args)
+          (if (and (file-exists-p temp-file) (> (file-attribute-size (file-attributes temp-file)) 0))
+              (with-temp-buffer
+                (let ((coding-system-for-read 'utf-8))
+                  (insert-file-contents temp-file))
+                (setq lines (split-string (buffer-string) "[\r\n]+" t)))
+            ;; フォールバック：標準出力から CP932 (Shift_JIS) で取得
+            (let* ((coding-system-for-read (if (eq system-type 'windows-nt) 'cp932-dos 'utf-8-dos))
+                   (output (with-output-to-string
+                             (with-current-buffer standard-output
+                               (apply #'process-file my/media-es-program nil t nil (list ext-query))))))
+              (setq lines (split-string output "[\r\n]+" t)))))
+      (when (file-exists-p temp-file)
+        (ignore-errors (delete-file temp-file))))
+    (mapcar (lambda (line) (replace-regexp-in-string "\\\\" "/" (string-trim line))) lines)))
+
+(defun my/media-candidates (file-list)
+  "Format FILE-LIST into completion candidates with badges and text properties."
+  (let ((id 0))
+    (mapcar
+     (lambda (fpath)
+       (setq id (1+ id))
+       (let* ((fname (file-name-nondirectory fpath))
+              (dir   (file-name-directory fpath))
+              (ext   (downcase (or (file-name-extension fpath) "")))
+              (is-vid (member ext '("mp4" "mkv" "avi" "wmv" "webm" "ts" "mov")))
+              (type-face (if is-vid 'font-lock-warning-face 'font-lock-keyword-face))
+              (suffix (propertize (format "\0%d" id) 'invisible t))
+              (disp (format "%-50s [%s]  %s%s"
+                            fname
+                            (propertize (upcase ext) 'face type-face)
+                            (propertize (or dir "") 'face 'font-lock-comment-face)
+                            suffix)))
+         (propertize disp 'media-path fpath)))
+     file-list)))
+
+(defun my/media-get-candidates (&optional refresh)
+  "Return formatted candidates from memory cache, disk cache, or es.exe."
+  (cond
+   ;; 1. 起動中はメモリキャッシュから即座に返す (0ms)
+   ((and (not refresh) my/media--candidates-cache)
+    my/media--candidates-cache)
+   ;; 2. メモリになくてもディスクキャッシュがあれば高速復元
+   ((and (not refresh)
+         (file-exists-p my/media-cache-file)
+         (> (file-attribute-size (file-attributes my/media-cache-file)) 0))
+    (message "[Media] キャッシュから高速読み込み中...")
+    (condition-case nil
+        (with-temp-buffer
+          (let ((coding-system-for-read 'utf-8))
+            (insert-file-contents my/media-cache-file))
+          (let ((files (split-string (buffer-string) "[\r\n]+" t)))
+            (setq my/media--candidates-cache (my/media-candidates files))
+            (message "[Media] キャッシュから %d 件を瞬時に読み込みました。" (length files))
+            my/media--candidates-cache))
+      (error (my/media-get-candidates t))))
+   ;; 3. 初回または C-u (refresh) 時は Everything から取得してキャッシュ保存
+   (t
+    (message "[Media] Everything から全メディアファイルを検索中...")
+    (let ((files (my/media-fetch-files)))
+      (if (null files)
+          (progn (message "[Media] メディアファイルが見つかりませんでした。") nil)
+        (ignore-errors
+          (let ((cache-dir (file-name-directory my/media-cache-file)))
+            (unless (file-exists-p cache-dir)
+              (make-directory cache-dir t)))
+          (with-temp-file my/media-cache-file
+            (let ((coding-system-for-write 'utf-8))
+              (insert (string-join files "\n")))))
+        (setq my/media--candidates-cache (my/media-candidates files))
+        (message "[Media] %d 件の音楽・動画を取得・キャッシュしました。" (length files))
+        my/media--candidates-cache)))))
+
+;;;###autoload
+(defun my/media-search-and-play (&optional refresh)
+  "Everything (es.exe) で全ドライブの音楽・動画をリアルタイム検索して再生する。
+C-u 付きで実行するとキャッシュを破棄して最新状態を再取得します。"
+  (interactive "P")
+  (let ((candidates (my/media-get-candidates refresh)))
+    (when candidates
+      (let* ((chosen (let ((orderless-matching-styles
+                            '(orderless-literal orderless-regexp orderless-migemo)))
+                       (completing-read
+                        (format "メディア検索 (%d 件): " (length candidates))
+                        candidates nil t)))
+             (fpath (when chosen
+                      (or (get-text-property 0 'media-path chosen)
+                          (let ((m (car (member chosen candidates))))
+                            (and m (get-text-property 0 'media-path m)))))))
         (if (not fpath)
-            (message "曲が選択されませんでした。")
+            (message "キャンセルされました。")
           (if (file-exists-p fpath)
               (progn
-                (w32-shell-execute "open" (subst-char-in-string ?/ ?\\ fpath))
-                (message "再生: %s" (file-name-nondirectory fpath)))
+                (message "再生: %s" (file-name-nondirectory fpath))
+                (if (eq system-type 'windows-nt)
+                    (w32-shell-execute "open" (subst-char-in-string ?/ ?\\ fpath))
+                  (call-process "xdg-open" nil 0 nil fpath)))
             (message "ファイルが存在しません: %s" fpath)))))))
 
-(defalias 'mp3-search #'my/m3u8-search-and-play)
-(defalias 'mp3-play #'my/m3u8-search-and-play)
-(defalias 'm3u8-search-and-play #'my/m3u8-search-and-play)
+(defalias 'media-play #'my/media-search-and-play)
+(defalias 'mp3-play #'my/media-search-and-play)
+(defalias 'mp3-play-clear-cache #'my/media-clear-cache)
 
 
 ;; タブバー・モードラインのダブルクリックで外部プログラム起動
@@ -1279,9 +1354,36 @@ C-u 付きで実行するとダイアログでファイルを選び直せます�
 (global-set-key [mode-line double-mouse-1] 'my-open-current-file-in-windows)
 
 ;; WinMerge で差分比較
+(defun my/winmerge-same-name-files (file)
+  "FILE と同名（ディレクトリ違い）のファイルを開いているバッファのパス一覧を返す。
+バッファの使用が新しい順に並ぶ。"
+  (let ((name (downcase (file-name-nondirectory file)))
+        result)
+    (dolist (buf (buffer-list))
+      (let ((f (buffer-file-name buf)))
+        (when (and f
+                   (string= (downcase (file-name-nondirectory f)) name)
+                   (not (file-equal-p f file))
+                   (not (member f result)))
+          (push f result))))
+    (nreverse result)))
+
+(defun my/winmerge-auto-save-file ()
+  "現在のバッファの自動保存ファイル（#名前#）が存在すればそのパスを返す。
+未保存の変更があれば、最新の内容を反映するため先に自動保存を実行する。"
+  (when buffer-auto-save-file-name
+    (when (buffer-modified-p)
+      (do-auto-save t t))          ; 現在のバッファだけ・メッセージなしで自動保存
+    (when (file-exists-p buffer-auto-save-file-name)
+      buffer-auto-save-file-name)))
+
 (defun my-compare-with-winmerge ()
   "今開いているファイルをWinMergeで差分比較します。
-2画面分割中は両方のファイルを比較、1画面のみの場合は同一ファイルを対象にします。"
+比較先は次の優先順位で決めます。
+1. 同名（ディレクトリ違い）のファイルを開いていればそれ（複数あれば選択）
+2. 2画面分割中なら、もう一方の画面のファイル
+3. 未保存の変更があれば自動保存ファイル（#名前#）
+4. それ以外は同一ファイル"
   (interactive)
   (let ((winmerge-path
          (or (executable-find "WinMergeU.exe")
@@ -1292,15 +1394,27 @@ C-u 付きで実行するとダイアログでファイルを選び直せます�
         (message "WinMergeU.exe が見つかりませんでした。インストールパスを確認してください。")
       (if (not buffer-file-name)
           (message "現在開いているバッファはファイルではありません。")
-        (let* ((file1      buffer-file-name)
-               (other-win  (next-window))
-               (file2      (if (and (not (eq (selected-window) other-win))
-                                   (buffer-file-name (window-buffer other-win)))
-                               (buffer-file-name (window-buffer other-win))
-                             file1)))
+        (let* ((file1 buffer-file-name)
+               (same  (my/winmerge-same-name-files file1))
+               (file2
+                (cond
+                 ;; 1. 同名ファイルが1つだけ → それと比較
+                 ((and same (null (cdr same))) (car same))
+                 ;; 1. 複数 → 選択（最近使ったものが初期値）
+                 (same (completing-read "比較先（同名ファイル）: " same nil t nil nil (car same)))
+                 ;; 2〜4. なければ隣の画面のファイル → 自動保存ファイル → 同一ファイル
+                 (t (let ((other-win (next-window)))
+                      (cond
+                       ((and (not (eq (selected-window) other-win))
+                             (buffer-file-name (window-buffer other-win)))
+                        (buffer-file-name (window-buffer other-win)))
+                       ((my/winmerge-auto-save-file))
+                       (t file1)))))))
           (w32-shell-execute "open" winmerge-path
                              (format "\"%s\" \"%s\"" file1 file2))
-          (message "WinMergeで比較中: %s" (file-name-nondirectory file1)))))))
+          (message "WinMergeで比較中: %s ⇔ %s"
+                   (abbreviate-file-name file1)
+                   (abbreviate-file-name file2)))))))
 
 (global-set-key (kbd "C-S-d") 'my-compare-with-winmerge)
 
@@ -1507,6 +1621,10 @@ C-u 付きで実行するとダイアログでファイルを選び直せます�
 ;; F7: howm 環境 ON/OFF トグル
 (global-set-key [f7] #'my/howm-toggle)
 (global-set-key (kbd "<f7>") #'my/howm-toggle)
+
+;; Ctrl+F7: howm の対象フォルダ切り替え (Vault 全体 / サブフォルダ)
+(global-set-key [C-f7] #'my/howm-switch-folder)
+(global-set-key (kbd "C-<f7>") #'my/howm-switch-folder)
 
 ;; Shift+F7: howm メモフォルダ内を consult-ripgrep で全文検索
 (defun my/howm-ripgrep (&optional initial)
@@ -2041,7 +2159,7 @@ wt.exe があれば Windows Terminal で、なければ標準のコンソール�
          (work-dir (if file-path
                        (file-name-directory file-path)
                      default-directory))
-         (script-file (expand-file-name "etc/run-agy.ps1" user-emacs-directory))
+         (script-file (expand-file-name "run-agy.ps1" user-emacs-directory))
          (prompt-arg (if (and prompt (not (string-empty-p prompt)))
                          (format " -Prompt \"%s\"" (replace-regexp-in-string "\"" "`\"" prompt))
                        ""))
@@ -2154,7 +2272,7 @@ wt.exe があれば Windows Terminal で、なければ標準のコンソール�
   [o] ファイルを開く                   [e] 現在のファイルを外部で開く
   [r] 最近のファイル                   [E] 任意のファイルを外部で開く
   [s] 上書き保存                       [R] 最近のファイルを外部で開く
-  [m] m3u8/m3u を検索して再生
+  [m] 音楽・動画を検索して再生 (Everything)
   [k] バッファを閉じる                 [AI・外部コマンド実行]
                                          [A] AI & Antigravity メニュー (hydra-ai)
                                          [a] Antigravity(agy) を cmd で実行
@@ -2176,7 +2294,7 @@ wt.exe があれば Windows Terminal で、なければ標準のコンソール�
   ("e" my-open-current-file-in-windows)
   ("E" my/open-any-file-in-windows)
   ("R" my/open-recent-file-in-windows)
-  ("m" my/m3u8-search-and-play)
+  ("m" my/media-search-and-play)
   ("A" hydra-ai/body)
   ("a" my/run-agy-cmd-on-current-file)
   ("x" my/run-command-cmd-on-current-file)
@@ -2436,10 +2554,29 @@ wt.exe があれば Windows Terminal で、なければ標準のコンソール�
     (define-key menu-map [separator-4]      '(menu-item "--"))
     (define-key menu-map [hydra-main]       '(menu-item "メインランチャーを開く" hydra-launcher/body :keys "M-o"))
 
-    ;; メニューバーの末尾（Help の右）に追加
+    ;; メニューバーの末尾（Help の右）に Fn_key と Navigator を追加
+    (let ((fn-map (make-sparse-keymap "Fn_key")))
+      (define-key fn-map [fn-f9]   '(menu-item "F9: メール開閉 (auximap)" auximap-toggle :keys "F9"))
+      (define-key fn-map [fn-s-f8] '(menu-item "S-F8: 週間天気予報" my/weather :keys "S-F8"))
+      (define-key fn-map [fn-f8]   '(menu-item "F8: カレンダー (howm予定連携)" my/open-calendar :keys "F8"))
+      (define-key fn-map [fn-s-f7] '(menu-item "S-F7: howm メモ全文検索" my/howm-ripgrep :keys "S-F7"))
+      (define-key fn-map [fn-f7]   '(menu-item "F7: howm メモ環境 (ON/OFF)" my/howm-toggle :keys "F7"))
+      (define-key fn-map [fn-sep3] '(menu-item "--"))
+      (define-key fn-map [fn-f6]   '(menu-item "F6: 電卓 (Calc)" calc :keys "F6"))
+      (define-key fn-map [fn-f5]   '(menu-item "F5: バッファ再読み込み (更新確認)" my/revert-buffer-with-confirm :keys "F5"))
+      (define-key fn-map [fn-f4]   '(menu-item "F4: 目次サイドバー開閉 (imenu-list)" imenu-list-smart-toggle :keys "F4"))
+      (define-key fn-map [fn-sep2] '(menu-item "--"))
+      (define-key fn-map [fn-s-f3] '(menu-item "S-F3: 検索開始 / 前を検索" my/isearch-backward-or-repeat :keys "S-F3"))
+      (define-key fn-map [fn-f3]   '(menu-item "F3: 検索開始 / 次を検索" my/isearch-forward-or-repeat :keys "F3"))
+      (define-key fn-map [fn-f2]   '(menu-item "F2: バッファ切り替え (consult-buffer)" consult-buffer :keys "F2"))
+      (define-key fn-map [fn-sep1] '(menu-item "--"))
+      (define-key fn-map [fn-s-f1] '(menu-item "S-F1: Emacs 標準ヘルプ" help-command :keys "S-F1"))
+      (define-key fn-map [fn-f1]   '(menu-item "F1: スマート操作ガイド" my/smart-help :keys "F1"))
+      (define-key global-map [menu-bar fn-keys] (cons "Fn_key" fn-map)))
+
     (define-key global-map [menu-bar navigator] (cons "Navigator" menu-map))
-    ;; Help より後ろに並べるため menu-bar-final-items に登録
-    (setq menu-bar-final-items (append menu-bar-final-items '(navigator)))))
+    ;; File を左端にし、既存の Help の右隣に Fn_key -> Navigator と並べる
+    (setq menu-bar-final-items '(help-menu fn-keys navigator))))
 
 ;; --- consult ---
 (use-package consult
@@ -2907,7 +3044,6 @@ wt.exe があれば Windows Terminal で、なければ標準のコンソール�
             (browse-url url)))
       (message "選択した候補からURLを取得できませんでした: %S" selected))))
 
-(defalias 'youtube-search #'my/consult-youtube)
 (defalias 'consult-youtube #'my/consult-youtube)
 
 ;; --- project.el と fd の連携 ---
@@ -3153,9 +3289,16 @@ howm-mode が有効な場合（howm 経由で開いた md）は表示しませ�
 
 ;; markdown-mode で outline-minor-mode を有効化
 ;; outline-regexp は行頭の # + 空白 にマッチさせる（本文中の ##タグ 等を除外）
+;; outline-regexp を差し替えると markdown-outline-level が nil を返し
+;; consult-outline が wrong-type-argument になるため、outline-level も自前で設定する
 (add-hook 'markdown-mode-hook
           (lambda ()
             (setq-local outline-regexp "^#+\\s-")
+            (setq-local outline-level
+                        (lambda ()
+                          (save-excursion
+                            (beginning-of-line)
+                            (skip-chars-forward "#"))))
             (outline-minor-mode 1)))
 
 ;; --- キーバインド ---
@@ -3179,11 +3322,54 @@ howm-mode が有効な場合（howm 経由で開いた md）は表示しませ�
   ;; howm-markdown を howm ロード前に適用
   (require 'howm-markdown)
 
-  (setq howm-directory    (expand-file-name "Documents/Obsidian-memo/01_kami"
-                                             (or (getenv "USERPROFILE") "~")))
+  ;; Obsidian Vault ルートとデフォルトフォルダ
+  (defvar my/howm-vault-root
+    (expand-file-name "Documents/Obsidian-memo" (or (getenv "USERPROFILE") "~"))
+    "Obsidian Vault のルートディレクトリ。")
+  (defvar my/howm-default-subfolder "01_kami"
+    "新規メモのデフォルト保存先サブフォルダ。")
+
+  ;; 初期状態は Vault 全体を対象にし、新規メモは 01_kami 配下に保存
+  (setq howm-directory my/howm-vault-root)
   (setq howm-keyword-file (expand-file-name ".howm-keys" howm-directory))
-  ;; ファイル名フォーマット（howm-markdown のデフォルトを上書き）
-  (setq howm-file-name-format "%Y%m%d-%H%M%S.md")
+  (setq howm-file-name-format (format "%s/%%Y%%m%%d-%%H%%M%%S.md" my/howm-default-subfolder))
+
+  ;; サブフォルダ一覧取得 & Consult 切り替え関数
+  (defun my/howm-get-vault-subfolders ()
+    "Vault 内の有効なサブフォルダ名一覧を取得します。"
+    (when (file-directory-p my/howm-vault-root)
+      (let ((entries (directory-files my/howm-vault-root t "^[^.]")))
+        (mapcar (lambda (d) (file-relative-name d my/howm-vault-root))
+                (seq-filter #'file-directory-p entries)))))
+
+  (defun my/howm-switch-folder ()
+    "howm の対象ディレクトリを Vault 全体または特定のサブフォルダに切り替えます。
+[Vault 全体] の場合は全サブフォルダを一覧・検索し、新規メモは 01_kami に作成します。
+特定のサブフォルダを選んだ場合は、そのフォルダ内にスコープを絞り込みます。"
+    (interactive)
+    (let* ((subfolders (my/howm-get-vault-subfolders))
+           (all-choice "[Vault 全体] (すべてのサブフォルダ)")
+           (candidates (cons all-choice subfolders))
+           (current-label
+            (if (string= (file-name-as-directory (expand-file-name howm-directory))
+                         (file-name-as-directory (expand-file-name my/howm-vault-root)))
+                all-choice
+              (file-relative-name howm-directory my/howm-vault-root)))
+           (choice (completing-read (format "howm 対象フォルダ (現在: %s): " current-label)
+                                    candidates nil t)))
+      (if (string= choice all-choice)
+          (progn
+            (setq howm-directory my/howm-vault-root)
+            (setq howm-file-name-format (format "%s/%%Y%%m%%d-%%H%%M%%S.md" my/howm-default-subfolder))
+            (message "howm を [Vault 全体] に切り替えました（新規メモ作成先: %s）" my/howm-default-subfolder))
+        (let ((target-dir (expand-file-name choice my/howm-vault-root)))
+          (setq howm-directory target-dir)
+          (setq howm-file-name-format "%Y%m%d-%H%M%S.md")
+          (message "howm を [%s] に切り替えました" choice)))
+      (setq howm-keyword-file (expand-file-name ".howm-keys" howm-directory))
+      (when (get-buffer "*howm-menu*")
+        (with-current-buffer "*howm-menu*"
+          (howm-menu-refresh)))))
 
   ;; howm メモは常に UTF-8 で読み込み・新規作成・保存する
   (setq howm-process-coding-system 'utf-8)
@@ -3269,7 +3455,57 @@ howm-mode が有効な場合（howm 経由で開いた md）は表示しませ�
     (define-key howm-view-contents-mode-map (kbd "q") #'quit-window))
 
   ;; howm-kill-all 実行後にミニバッファのプロンプトをクリアする
-  (advice-add 'howm-kill-all :after (lambda (&rest _) (message nil))))
+  (advice-add 'howm-kill-all :after (lambda (&rest _) (message nil)))
+
+  ;; Obsidian 固有フォルダを除外
+  (with-eval-after-load 'howm-vars
+    (add-to-list 'howm-excluded-dirs ".obsidian")
+    (add-to-list 'howm-excluded-dirs ".trash"))
+
+  ;; C-c , D でフォルダ切り替え可能に
+  (define-key howm-mode-map (kbd "C-c , D") #'my/howm-switch-folder)
+  (with-eval-after-load 'howm-menu
+    (define-key howm-menu-mode-map (kbd "D") #'my/howm-switch-folder))
+
+  ;; howm × Obsidian 操作ガイド (Hydra / F1)
+  (defhydra hydra-howm-help (:color blue :hint nil)
+    "
+  === howm × Obsidian 操作ガイド ===  [F7 / F1 / q] 閉じる
+  [メモ作成・編集]                    [検索・一覧]
+  c     : 新規メモ (01_kami に保存)   a     : 全メモ一覧 (howm-list-all)
+  C-c , c: howm新規作成               l     : 最近のメモ (howm-list-recent)
+  C-c v : 画像貼り付け (img/)         S-F7  : Vault全体を全文検索 (rg)
+  C-c # : #タグを全文検索             s / g : howm内蔵検索 (grep)
+  ----------------------------------------------------------------------
+  [サブフォルダ切り替え (Obsidian)]   [カレンダー・画面操作]
+  D / C-F7 : フォルダ切替 (Consult)   F8    : カレンダー開閉 (calfw)
+             (Vault全体 ⇔ 各フォルダ) q     : ウィンドウを閉じる
+             ※初期状態: Vault全体走査  RET   : 選択項目のメモを開く
+  ----------------------------------------------------------------------
+"
+    ("c" howm-create :color blue)
+    ("a" howm-list-all :color blue)
+    ("l" howm-list-recent :color blue)
+    ("D" my/howm-switch-folder :color blue)
+    ("d" my/howm-switch-folder :color blue)
+    ("s" howm-list-grep :color blue)
+    ("g" howm-list-grep :color blue)
+    ("S-F7" my/howm-ripgrep :color blue)
+    ("<S-f7>" my/howm-ripgrep :color blue)
+    ("F8" my/open-calendar :color blue)
+    ("<f8>" my/open-calendar :color blue)
+    ("v" my/howm-paste-image :color blue)
+    ("q" nil :color blue)
+    ("<escape>" nil :color blue)
+    ("<f1>" nil :color blue)
+    ("<F1>" nil :color blue)
+    ("<f7>" nil :color blue)
+    ("<F7>" nil :color blue))
+
+  (define-key howm-mode-map (kbd "<f1>") (lambda () (interactive) (if (fboundp 'hydra-howm-help/body) (hydra-howm-help/body) (describe-mode))))
+  (with-eval-after-load 'howm-menu
+    (define-key howm-menu-mode-map (kbd "<f1>") (lambda () (interactive) (if (fboundp 'hydra-howm-help/body) (hydra-howm-help/body) (describe-mode))))
+    (define-key howm-menu-mode-map (kbd "?") (lambda () (interactive) (if (fboundp 'hydra-howm-help/body) (hydra-howm-help/body) (describe-mode))))))
 
 
 ;; ④ Cosense × Markdown ハイブリッド・シンタックスハイライト
@@ -3480,12 +3716,14 @@ howm-mode が有効な場合（howm 経由で開いた md）は表示しませ�
 (defun my/calfw-howm-memo-period-to-calendar (begin end)
   "BEGIN から END までの期間に作成された howm メモを calfw 形式で返す。"
   (let* ((dir (or (bound-and-true-p howm-directory)
-                  (expand-file-name "Documents/Obsidian-memo/01_kami" (getenv "USERPROFILE"))))
+                  (expand-file-name "Documents/Obsidian-memo" (getenv "USERPROFILE"))))
          (begin-abs (calendar-absolute-from-gregorian begin))
          (end-abs (calendar-absolute-from-gregorian end))
          (contents nil))
     (when (file-directory-p dir)
-      (dolist (filepath (directory-files dir t "\\`[0-9]\\{8\\}-.*\\.md\\'"))
+      (dolist (filepath (directory-files-recursively dir "\\`[0-9]\\{8\\}-.*\\.md\\'" nil
+                                                    (lambda (d)
+                                                      (not (string-prefix-p "." (file-name-nondirectory d))))))
         (let ((filename (file-name-nondirectory filepath)))
           (when (string-match "\\`\\([0-9]\\{4\\}\\)\\([0-9]\\{2\\}\\)\\([0-9]\\{2\\}\\)-" filename)
             (let* ((year (string-to-number (match-string 1 filename)))
@@ -3563,7 +3801,9 @@ howm-mode が有効な場合（howm 経由で開いた md）は表示しませ�
       (let* ((now (current-time))
              (now-str (format-time-string "%Y-%m-%d %H:%M" now))
              (file-name (format-time-string "%Y%m%d-%H%M%S_schedule.md" now))
-             (file-path (expand-file-name file-name howm-directory))
+             (save-dir (expand-file-name (or (bound-and-true-p my/howm-default-subfolder) "01_kami")
+                                         (or (bound-and-true-p my/howm-vault-root) howm-directory)))
+             (file-path (expand-file-name file-name save-dir))
              (schedule-text
               (if (string-match "\\`\\([0-9]\\{1,2\\}:[0-9]\\{2\\}\\)[[:space:]]+\\(.*\\)\\'" input)
                   (let ((time (match-string 1 input))
@@ -3572,6 +3812,8 @@ howm-mode が有効な場合（howm 経由で開いた md）は表示しませ�
                 (format "[%s]@ %s" date-str input)))
              (content (format "# %s\n#schedule #howm\n[%s]\n\n%s\n"
                               schedule-text now-str schedule-text)))
+        (unless (file-directory-p save-dir)
+          (make-directory save-dir t))
         (with-temp-file file-path
           (insert content))
         (when (fboundp 'howm-keyword-update)
@@ -3590,7 +3832,11 @@ howm-mode が有効な場合（howm 経由で開いた md）は表示しませ�
          (now (current-time))
          (now-str (format-time-string "%Y-%m-%d %H:%M" now))
          (file-name (format-time-string "%Y%m%d-%H%M%S.md" now))
-         (file-path (expand-file-name file-name howm-directory)))
+         (save-dir (expand-file-name (or (bound-and-true-p my/howm-default-subfolder) "01_kami")
+                                     (or (bound-and-true-p my/howm-vault-root) howm-directory)))
+         (file-path (expand-file-name file-name save-dir)))
+    (unless (file-directory-p save-dir)
+      (make-directory save-dir t))
     (find-file file-path)
     (insert (format "# [%s]@ \n#schedule #howm\n[%s]\n\n" date-str now-str))
     (forward-line -4)
@@ -3611,7 +3857,7 @@ howm-mode が有効な場合（howm 経由で開いた md）は表示しませ�
          (date-compact (format "%04d%02d%02d" y m d))
          (date-hyphen (format "%04d-%02d-%02d" y m d))
          (dir (or (bound-and-true-p howm-directory)
-                  (expand-file-name "Documents/Obsidian-memo/01_kami" (getenv "USERPROFILE"))))
+                  (expand-file-name "Documents/Obsidian-memo" (getenv "USERPROFILE"))))
          (matched-files nil)
          (open-and-setup
           (lambda (filepath)
@@ -3630,7 +3876,9 @@ howm-mode が有効な場合（howm 経由で開いた md）は表示しませ�
                                          c w)))
                         nil t)))))
     (when (file-directory-p dir)
-      (dolist (f (directory-files dir t "\\.md\\'"))
+      (dolist (f (directory-files-recursively dir "\\.md\\'" nil
+                                              (lambda (d)
+                                                (not (string-prefix-p "." (file-name-nondirectory d))))))
         (let ((fname (file-name-nondirectory f)))
           (when (and (not (string-match-p "\\`0000" fname))
                      (or (string-match-p (concat "\\`" date-compact) fname)
@@ -3682,11 +3930,11 @@ howm-mode が有効な場合（howm 経由で開いた md）は表示しませ�
          (now (current-time))
          (time-str (format-time-string "%H%M%S" now))
          (file-name (format "%04d%02d%02d-%s.md" y m d time-str))
-         (dir (or (bound-and-true-p howm-directory)
-                  (expand-file-name "Documents/Obsidian-memo/01_kami" (getenv "USERPROFILE"))))
-         (file-path (expand-file-name file-name dir)))
-    (unless (file-directory-p dir)
-      (make-directory dir t))
+         (save-dir (expand-file-name (or (bound-and-true-p my/howm-default-subfolder) "01_kami")
+                                     (or (bound-and-true-p my/howm-vault-root) howm-directory)))
+         (file-path (expand-file-name file-name save-dir)))
+    (unless (file-directory-p save-dir)
+      (make-directory save-dir t))
     (find-file file-path)
     (insert (format "# \n#memo\n[%s %s]\n\n" date-str (format-time-string "%H:%M" now)))
     (goto-char (point-min))
@@ -5405,20 +5653,23 @@ EPUB への変換とオープンが終わったら、元の AZW/AZW3 バッフ�
 
   ;; Helix風: ミニバッファ対話式の一括置換 (r)
   (defun my/meow-replace (replacement)
-    "選択範囲（またはBeacon全マッチ箇所）をミニバッファ入力した文字列で置換する。
-空エンターの場合は直前のコピー内容（クリップボード）で置換する。"
+    "選択範囲（またはBeacon全マッチ箇所）をミニバッファ入力した文字列で置換する。初期入力は直前のコピー内容。そのまま Enter でコピー内容、全部消して Enter で空文字列（削除）。"
     (interactive
-     (let* ((clip (current-kill 0 t))
-            (prompt (if (and clip (not (string-empty-p clip)))
-                        (format "Replace with (Enter for \"%s\"): "
-                                (if (> (length clip) 15)
-                                    (concat (substring clip 0 15) "...")
-                                  clip))
-                      "Replace with: ")))
-       (list (read-string prompt nil nil clip))))
-    (let ((rep (if (string-empty-p replacement)
-                   (or (current-kill 0 t) "")
-                 replacement)))
+     (let* ((clip (or (ignore-errors (current-kill 0 t)) ""))
+            (prompt (if (string-empty-p clip)
+                        "Replace with: "
+                      "Replace with (初期値=コピー内容 / 全消しで削除): ")))
+       ;; クリップボードが空でない場合はミニバッファを全選択状態で開く
+       ;; （そのまま入力で上書き、Delete で消去して空文字列置換が可能）
+       (list (if (string-empty-p clip)
+                 (read-string prompt)
+               (minibuffer-with-setup-hook
+                   (lambda ()
+                     (set-mark (minibuffer-prompt-end))
+                     (goto-char (point-max))
+                     (activate-mark))
+                 (read-string prompt clip))))))
+    (let ((rep replacement))   ; ← 空文字列もそのまま使う
       (cond
        ;; ケース1: Beacon状態（s でマッチした複数箇所）
        ((bound-and-true-p meow-beacon-mode)
@@ -5450,14 +5701,12 @@ EPUB への変換とオープンが終わったら、元の AZW/AZW3 バッフ�
           (message "Replaced with \"%s\"" rep)))
        ;; ケース3: 選択がない場合（カーソル下の単語を自動選択して置換）
        (t
-        (meow-mark-word 1)
-        (when (use-region-p)
-          (let ((beg (region-beginning))
-                (end (region-end)))
-            (delete-region beg end)
-            (insert rep)
-            (meow--cancel-selection)
-            (message "Replaced word with \"%s\"" rep)))))))
+        (if-let* ((bounds (bounds-of-thing-at-point 'word)))
+            (progn
+              (delete-region (car bounds) (cdr bounds))
+              (insert rep)
+              (message "Replaced word with \"%s\"" rep))
+          (message "[meow-replace] No word at point"))))))
 
   ;; 万能脱出: 選択解除およびBeacon（マルチカーソル）完全解除 (ESC)
   (defun my/meow-cancel-selection ()
@@ -5620,8 +5869,9 @@ M-0〜M-9を前置した場合はそのレジスタへコピーする（削除�
   M-g m   : 足跡一覧 (consult-mark)                     M-g M     : 全ファイル足跡一覧
   ----------------------------------------------------------------------
   [ファンクションキー早見表]
-  F1: このガイド   F2: バッファ切替 (Consult)   F3: 検索 (Migemo)   F4: 目次サイドバー
-  F5: 更新 (確認)  F6: 電卓 (Calc)  F7: howm (S-F7:検索)  F8: カレンダー (S-F8:天気)
+  F1: ガイド (S-F1:標準ヘルプ)  F2: バッファ切替   F3: 検索 (S-F3:前へ)
+  F4: 目次サイドバー   F5: 更新 (確認)   F6: 電卓 (Calc)
+  F7: howm (S-F7:検索) F8: カレンダー (S-F8:天気) F9: メール (auximap)
   ----------------------------------------------------------------------
   [Tab / n] NORMALへ   [s] Consultメニュー   [m / M] 足跡一覧   [H] 標準ヘルプ   [q / ESC / F1] 閉じる
 "
@@ -5665,8 +5915,9 @@ M-0〜M-9を前置した場合はそのレジスタへコピーする（削除�
                             SPC s   : Consult 探索メニュー (各種探索ツール)
   ----------------------------------------------------------------------
   [ファンクションキー早見表]
-  F1: このガイド   F2: バッファ切替 (Consult)   F3: 検索 (Migemo)   F4: 目次サイドバー
-  F5: 更新 (確認)  F6: 電卓 (Calc)  F7: howm (S-F7:検索)  F8: カレンダー (S-F8:天気)
+  F1: ガイド (S-F1:標準ヘルプ)  F2: バッファ切替   F3: 検索 (S-F3:前へ)
+  F4: 目次サイドバー   F5: 更新 (確認)   F6: 電卓 (Calc)
+  F7: howm (S-F7:検索) F8: カレンダー (S-F8:天気) F9: メール (auximap)
   ----------------------------------------------------------------------
   [Grab: テキスト入替の神機能]
   G : 選択をキープ (Grab)  → 別の場所を選択して R で瞬時に入替え！ (Y: 上書き)
@@ -5694,6 +5945,11 @@ M-0〜M-9を前置した場合はそのレジスタへコピーする（削除�
 特殊モード以外でもガイドを確実に優先表示し、S-F1 で標準ヘルプを開く。"
     (interactive)
     (cond
+     ((and (or (derived-mode-p 'howm-mode 'howm-menu-mode 'howm-view-summary-mode 'howm-view-contents-mode)
+               (memq major-mode '(howm-mode howm-menu-mode howm-view-summary-mode howm-view-contents-mode))
+               (string-match-p "\\*howm" (buffer-name)))
+           (fboundp 'hydra-howm-help/body))
+      (hydra-howm-help/body))
      ((and (or (bound-and-true-p gptel-mode)
                (derived-mode-p 'gptel-mode)
                (string-match-p "\\*.*\\(Chat\\|AI-Response\\|gptel\\).*" (buffer-name)))
@@ -5705,6 +5961,10 @@ M-0〜M-9を前置した場合はそのレジスタへコピーする（削除�
       (hydra-eww-help/body))
      ((and (derived-mode-p 'nov-mode) (fboundp 'hydra-nov-help/body))
       (hydra-nov-help/body))
+     ((and (derived-mode-p 'auximap-mode) (fboundp 'hydra-auximap-help/body))
+      (hydra-auximap-help/body))
+     ((and (derived-mode-p 'auximap-view-mode) (fboundp 'hydra-auximap-view-help/body))
+      (hydra-auximap-view-help/body))
      ((and (bound-and-true-p meow-mode) (not (bound-and-true-p meow-insert-mode)))
       (hydra-meow-help/body))
      ((fboundp 'hydra-meow-insert-help/body)
@@ -5939,7 +6199,9 @@ M-0〜M-9を前置した場合はそのレジスタへコピーする（削除�
           (prog-mode . insert)
           (text-mode . insert)
           (conpty-mode . insert)
-          (term-mode . insert)))
+          (term-mode . insert)
+          (auximap-mode . motion)
+          (auximap-view-mode . motion)))
 
   ;; 通常ファイルを新規・既存で開いた時は、確実に INSERT モードで開始する
   ;; （※ Dired、Help、特殊バッファなどの閲覧専用画面は除く）
@@ -6035,10 +6297,7 @@ M-0〜M-9を前置した場合はそのレジスタへコピーする（削除�
   "U-NEXT の動画を検索し、ミニバッファ（Vertico）で作品を選択して専用ウィンドウで開く。"
   (interactive "sU-NEXT 検索キーワード: ")
   (let* ((script-candidates
-          (list (expand-file-name "etc/unext_search.py" user-emacs-directory)
-                (expand-file-name "scripts/unext_search.py" user-emacs-directory)
-                (expand-file-name "tools/unext_search.py" user-emacs-directory)
-                (expand-file-name "unext_search.py" user-emacs-directory)
+          (list (expand-file-name "unext_search.py" user-emacs-directory)
                 (expand-file-name "unext_search.py" (file-name-directory (or load-file-name buffer-file-name default-directory)))
                 (expand-file-name "unext_search.py" default-directory)))
          (script (cl-find-if #'file-exists-p script-candidates)))
@@ -6443,17 +6702,16 @@ C-u を前置した場合は URL のみをコピーする。"
 
 
 ;; =====================================================================
-;; 軽量株式チャートブラウザ (my-stock-chart.el)
+;; 軽量株式チャートブラウザ (stock-charts.el)
 ;; =====================================================================
 ;; meigaralist.txt の銘柄・テーマ別リアルタイムチャートを表示
-(let ((stock-chart-dir (expand-file-name "site-lisp/my-stock-chart" user-emacs-directory)))
-  (when (file-directory-p stock-chart-dir)
-    (add-to-list 'load-path stock-chart-dir))
-  (when (require 'my-stock-chart nil t)
+(let ((stock-charts-dir (expand-file-name "lisp/stock-charts" user-emacs-directory)))
+  (when (file-directory-p stock-charts-dir)
+    (add-to-list 'load-path stock-charts-dir))
+  (when (or (require 'stock-charts nil t)
+            (require 'my-stock-chart nil t))
     (defalias 'stock-charts #'my/stock-chart-open)
-    (defalias 'stock-chart #'my/stock-chart-open)
-    (defalias 'consult-stock-chart-all #'my/stock-chart-search-all)
-    (defalias 'consult-stock-chart-my #'my/stock-chart-search-my)))
+    (defalias 'consult-stock-chart-all #'my/stock-chart-search-all)))
 
 ;; =====================================================================
 ;; gptel（Qwen / LLM チャットクライアント）
@@ -6494,3 +6752,20 @@ C-u を前置した場合は URL のみをコピーする。"
         (if (fboundp 'hydra-gptel-help/body)
             (hydra-gptel-help/body)
           (describe-mode))))))
+
+;; =====================================================================
+;; auximap (IMAP メール一覧・閲覧・管理)
+;; =====================================================================
+(autoload 'auximap "auximap" "Browse IMAP email in Emacs." t)
+(autoload 'auximap-reload "auximap" "Reload IMAP email list." t)
+(autoload 'auximap-toggle "auximap" "Toggle auximap email reader." t)
+(global-set-key (kbd "<f9>") #'auximap-toggle)
+(global-set-key [f9] #'auximap-toggle)
+
+;; =====================================================================
+;; auxbookmark (Consult Web ブックマーク横断検索)
+;; =====================================================================
+(autoload 'consult-auxbookmark "auxbookmark" "Search all Web Bookmarks with Consult." t)
+(autoload 'auxbookmark-consult "auxbookmark" "Search all Web Bookmarks with Consult." t)
+(global-set-key (kbd "C-c b") #'consult-auxbookmark)
+
