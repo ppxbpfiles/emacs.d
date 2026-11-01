@@ -126,6 +126,7 @@ NORMAL/INSERT/MOTION等の状態を持つモーダル編集レイヤー。CUAの
 | `C-e` | 行頭・行末のスマートトグル（インデント先頭 ⇆ 本当の行頭 ⇆ 行末） |
 | `C-x r b` / `SPC b` / `M-o b` | ブックマーク一覧（consult-bookmark） |
 | `C-x r m` | 現在のバッファ・位置をブックマーク保存（bookmark-set） |
+| `C-x m` | Ghostel 端末を開く（PowerShell） |
 | `Alt + ←` | バッファ履歴を戻る（ブラウザの「戻る」のようにいくつ前でも過去のファイルへ遡る） |
 | `Alt + →` | バッファ履歴を進む（ブラウザの「進む」） |
 | `C-'` | ピン留め（目印を打つ）（範囲選択を起こさずに足跡履歴へ登録。どこにも飛ばず何箇所でも打てます） |
@@ -263,8 +264,8 @@ NORMAL/INSERT/MOTION等の状態を持つモーダル編集レイヤー。CUAの
 | `s` | プロジェクト内全文検索（ripgrep） |
 | `g` | プロジェクト内ファイル名検索（fd） |
 | `f` | 最近使ったファイルを開く |
-| `c` | cmd.exe（ConPTY ターミナル） |
-| `p` | PowerShell（ConPTY ターミナル） |
+| `c` | cmd.exe（Ghostel 端末） |
+| `p` | PowerShell（Ghostel 端末） |
 | `L` | カレンダー（calfw） |
 | `d` | 辞書（Lookup） |
 | `w` | ウィンドウ操作サブメニュー |
@@ -302,8 +303,8 @@ NORMAL/INSERT/MOTION等の状態を持つモーダル編集レイヤー。CUAの
 | `O` | バッファ一括検索・編集（moccur） |
 | `L` | カレンダー（calfw） |
 | `W` | 週間天気予報（中四国・全国） |
-| `c` | cmd.exe（ConPTY） |
-| `P` | PowerShell（ConPTY） |
+| `c` | cmd.exe（ghostel） |
+| `P` | PowerShell（ghostel） |
 | `C` | 電卓メニュー（calc） → |
 | `T` | テキスト変換サブメニュー → |
 | `q` | 閉じる |

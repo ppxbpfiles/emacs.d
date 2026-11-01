@@ -92,8 +92,8 @@
 | `s` | プロジェクト内全文検索（ripgrep） |
 | `g` | プロジェクト内ファイル名検索（fd） |
 | `f` | 最近使ったファイルを開く |
-| `c` | cmd.exe（ConPTY ターミナル） |
-| `p` | PowerShell（ConPTY ターミナル） |
+| `c` | cmd.exe（Ghostel 端末） |
+| `p` | PowerShell（Ghostel 端末） |
 | `L` | カレンダー（calfw） |
 | `d` | 辞書（Lookup） |
 | `w` | ウィンドウ操作サブメニュー |
@@ -261,6 +261,7 @@
 | tr-ime | IME 制御（w32-ime 互換）— 現在は `my/use-mozc-modeless = t` のため **無効** |
 | mozc / mozc-modeless | モードレス日本語入力（Google 日本語入力連携）— **現在の主体**。Windows Terminal 上の `-nw` 環境でも OS の IME 制約を受けずに動作 |
 | conpty | Windows ConPTY ターミナル（emacs-conpty） |
+| ghostel | Ghostty VTエンジンによる高速端末エミュレータ（24bitカラー・Kittyプロトコル対応） |
 | atomic-chrome | GhostText 拡張機能と連携したブラウザ入力欄の編集 |
 
 ### 全インストールパッケージ一覧 (MELPA)
@@ -281,6 +282,7 @@
 - `dmacro` — 繰り返し操作の自動マクロ実行（`C-t`）
 - `embark` / `embark-consult` — 選択候補への即時アクションランチャー
 - `gptel` — LLM との対話
+- `ghostel` — Ghostty VTエンジンによる高速端末エミュレータ（`C-x m`）
 - `hide-mode-line` — 不要なウィンドウ（サイドバー等）でモードラインを非表示化
 - `howm` — 個人メモ管理（Obsidian 互換 Markdown）
 - `hydra` — キーバインドメニュー
