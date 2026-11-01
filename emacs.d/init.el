@@ -508,8 +508,8 @@ USB等のポータブルドライブへの直接書き込みで終了時に固�
    ("s" . my/consult-ripgrep-project)
    ("g" . my/consult-fd-project)
    ("f" . consult-recent-file)
-   ("c" . conpty)
-   ("p" . conpty-powershell)
+   ("c" . my/ghostel-cmd)
+   ("p" . ghostel)
    ("L" . my/open-calendar)
    ("d" . lookup)
    ("w" . hydra-window/body)
@@ -551,7 +551,7 @@ USB等のポータブルドライブへの直接書き込みで終了時に固�
     (insert "\n=== クイックメニュー (キーを押して直接実行 / [o] で全ランチャー表示) ===\n\n")
     (insert "  [e] Everything (PC検索)   [s] プロジェクト検索     [g] ファイル検索 (fd)\n")
     (insert "  [f] 最近使ったファイル     [w] ウィンドウ操作メニュー [d] 辞書検索 (Lookup)\n")
-    (insert "  [L] カレンダー (calfw)     [p] PowerShell (conpty)  [c] cmd.exe (conpty)\n")
+    (insert "  [L] カレンダー (calfw)     [p] PowerShell (ghostel) [c] cmd.exe (ghostel)\n")
     (insert "  [F] ファイル操作メニュー   [o] メインメニュー (Hydra)\n"))
 
   ;; ジェネレーターの登録
@@ -710,9 +710,6 @@ USB等のポータブルドライブへの直接書き込みで終了時に固�
             (my/tb-add '03-save      'save-buffer                      "tb-save"         "保存")
             (my/tb-add '02-open      'menu-find-file-existing          "tb-open"         "ファイルを開く")
             (my/tb-add '01-new       'find-file                        "tb-new"          "新規ファイルを開く")))
-
-;; 現在の編集行を常時ハイライトする (hl-line)
-(global-hl-line-mode 1)
 
 ;; カーソルを見失わないように、移動・スクロール・ウィンドウ切り替え時に行を光らせる (pulsar)
 (use-package pulsar
@@ -1724,6 +1721,40 @@ C-u 付きで実行するとキャッシュを破棄して最新状態を再取�
       (setq conpty-program (expand-file-name "bin/emacs-conpty.exe"
                                              (expand-file-name ".." user-emacs-directory))))))
 
+;; ghostel (Ghostty VTエンジンによる端末エミュレータ)
+(defvar ghostel-shell)
+(use-package ghostel
+  :ensure t
+  :bind (("C-x m" . ghostel)
+         :map ghostel-semi-char-mode-map
+         ("<backspace>" . ghostel--send-event)
+         ("DEL"         . ghostel--send-event))
+  :init
+  ;; Windows環境のシェルを動的に解決（pwsh -> powershell -> cmd.exe）
+  (setq ghostel-shell
+        (cond
+         ((executable-find "pwsh") "pwsh.exe")
+         ((executable-find "powershell") "powershell.exe")
+         ((executable-find "cmd.exe") "cmd.exe")
+         (t (getenv "COMSPEC"))))
+  :config
+  ;; 端末バッファ内では構造編集(puni)をOFFにしてキー奪取を防ぐ
+  (add-hook 'ghostel-mode-hook
+            (lambda ()
+              (when (bound-and-true-p puni-mode)
+                (puni-mode -1))))
+
+  ;; プロジェクト連携 (project.el)
+  (with-eval-after-load 'project
+    (add-to-list 'project-switch-commands '(ghostel-project "Ghostel") t)
+    (add-to-list 'project-switch-commands '(ghostel-project-list-buffers "Ghostel buffers") t)))
+
+(defun my/ghostel-cmd ()
+  "cmd.exe をシェルとして Ghostel 端末バッファを開きます。"
+  (interactive)
+  (let ((ghostel-shell "cmd.exe"))
+    (ghostel)))
+
 ;; ドラッグ＆ドロップでファイルを開く挙動を強制的に有効化
 (setq dnd-protocol-alist
       '(("^file:///" . dnd-open-local-file)
@@ -2014,10 +2045,13 @@ C-u 付きで実行するとキャッシュを破棄して最新状態を再取�
   "CMD を SHELL ('cmd または 'powershell) の外部ターミナルウィンドウで実行します。
 wt.exe があれば Windows Terminal で、なければ標準のコンソール（ConHost）で起動します。"
   (let* ((wt (or (executable-find "wt.exe") (executable-find "wt")))
+         (pwsh-exe (or (executable-find "pwsh.exe") (executable-find "pwsh")))
+         (ps-bin (if pwsh-exe "pwsh.exe" "powershell.exe"))
          (file-path (buffer-file-name))
-         (run-dir (if file-path
-                      (expand-file-name (file-name-directory file-path))
-                    (expand-file-name default-directory)))
+         (run-dir (convert-standard-filename
+                   (if file-path
+                       (expand-file-name (file-name-directory file-path))
+                     (expand-file-name default-directory))))
          ;; PowerShell 用: 1行の -Command 文字列にまとめて渡す方式は、
          ;; Windows のコマンドライン再構成の過程でパス中の "(" ")" 等の
          ;; 特殊文字と噛み合わずクォートが壊れることがある(例:
@@ -2027,14 +2061,18 @@ wt.exe があれば Windows Terminal で、なければ標準のコンソール�
          ;; コマンドライン再構成を経由しないのでこの種の崩れが起きない。
          (ps-script-file (and (eq shell 'powershell) (make-temp-file "emacs-run-" nil ".ps1")))
          (ps-args (when ps-script-file
-                    (with-temp-file ps-script-file
-                      (insert "Set-Location -LiteralPath '"
-                              (replace-regexp-in-string "'" "''" run-dir t t)
-                              "'\n"
-                              cmd
-                              "\n"
-                              "Remove-Item -Force -LiteralPath $PSCommandPath\n"))
-                    (format "-NoExit -ExecutionPolicy Bypass -File \"%s\"" ps-script-file))))
+                    (let ((coding-system-for-write 'utf-8-with-signature-dos))
+                      (with-temp-file ps-script-file
+                        (insert "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
+                                "$OutputEncoding = [System.Text.Encoding]::UTF8\n"
+                                "Set-Location -LiteralPath '"
+                                (replace-regexp-in-string "'" "''" run-dir t t)
+                                "'\n"
+                                cmd
+                                "\n"
+                                "Remove-Item -Force -LiteralPath $PSCommandPath\n")))
+                    (format "-NoExit -ExecutionPolicy Bypass -File \"%s\""
+                            (convert-standard-filename ps-script-file)))))
     (cond
      (wt
       (cond
@@ -2045,7 +2083,7 @@ wt.exe があれば Windows Terminal で、なければ標準のコンソール�
        ((eq shell 'powershell)
         (w32-shell-execute
          "open" wt
-         (concat "powershell.exe " ps-args)))))
+         (concat ps-bin " " ps-args)))))
      (t
       (cond
        ((eq shell 'cmd)
@@ -2054,12 +2092,13 @@ wt.exe があれば Windows Terminal で、なければ標準のコンソール�
          (concat "/k cd /d \"" run-dir "\" && " cmd)))
        ((eq shell 'powershell)
         (w32-shell-execute
-         "open" "powershell.exe"
+         "open" ps-bin
          ps-args)))))))
 
 (defun my/run-command-cmd-on-current-file (cmd)
   "現在のファイルを引数にして、cmd.exe 経由で外部コマンドを外部ターミナルで実行します。
-%f は現在のファイルパスに置き換わります（なければ末尾に追加）。"
+%f は現在のファイルパスに置き換わります（なければ末尾に追加）。
+コマンドが agy でオプションが未指定の場合は自動的に -i で渡します。"
   (interactive "s[cmd] 実行する外部コマンド (例: python, agy(Antigravity) -y): ")
   (let ((file (buffer-file-name)))
     (if (not file)
@@ -2069,7 +2108,11 @@ wt.exe があれば Windows Terminal で、なければ標準のコンソール�
       (let* ((quoted-file (shell-quote-argument file))
              (final-cmd (if (string-match-p "%f" cmd)
                             (replace-regexp-in-string "%f" quoted-file cmd t t)
-                          (concat cmd " " quoted-file))))
+                          (let ((trimmed (string-trim cmd)))
+                            (if (and (string-match-p "\\`agy\\(\\.exe\\)?\\(\\s-+\\|\\'\\)" trimmed)
+                                     (not (string-match-p "\\(?:\\s-\\|\\`\\)-[ip]\\(?:\\s-\\|\\'\\)\\|--\\(prompt-interactive\\|print\\|prompt\\)" trimmed)))
+                                (concat trimmed " -i " quoted-file)
+                              (concat trimmed " " quoted-file))))))
         (my/run-in-external-terminal 'cmd final-cmd)))))
 
 (defun my/ps-quote-argument (file)
@@ -2077,11 +2120,13 @@ wt.exe があれば Windows Terminal で、なければ標準のコンソール�
 ダブルクォートは w32-shell-execute 経由でWindowsに剥ぎ取られるため
 シングルクォートを使う。PowerShell のシングルクォートは括弧等を含む
 パスをリテラルとして安全に渡せる。内部にシングルクォートがあれば '' に変換。"
-  (concat "'" (replace-regexp-in-string "'" "''" file t t) "'"))
+  (let ((win-file (convert-standard-filename file)))
+    (concat "'" (replace-regexp-in-string "'" "''" win-file t t) "'")))
 
 (defun my/run-command-powershell-on-current-file (cmd)
   "現在のファイルを引数にして、PowerShell 経由で外部コマンドを外部ターミナルで実行します。
-%f は現在のファイルパスに置き換わります（なければ末尾に追加）。"
+%f は現在のファイルパスに置き換わります（なければ末尾に追加）。
+コマンドが agy でオプションが未指定の場合は自動的に -i で渡します。"
   (interactive "s[PowerShell] 実行する外部コマンド (例: python, agy(Antigravity) -y): ")
   (let ((file (buffer-file-name)))
     (if (not file)
@@ -2091,7 +2136,11 @@ wt.exe があれば Windows Terminal で、なければ標準のコンソール�
       (let* ((quoted-file (my/ps-quote-argument file))
              (final-cmd (if (string-match-p "%f" cmd)
                             (replace-regexp-in-string "%f" quoted-file cmd t t)
-                          (concat cmd " " quoted-file))))
+                          (let ((trimmed (string-trim cmd)))
+                            (if (and (string-match-p "\\`agy\\(\\.exe\\)?\\(\\s-+\\|\\'\\)" trimmed)
+                                     (not (string-match-p "\\(?:\\s-\\|\\`\\)-[ip]\\(?:\\s-\\|\\'\\)\\|--\\(prompt-interactive\\|print\\|prompt\\)" trimmed)))
+                                (concat trimmed " -i " quoted-file)
+                              (concat trimmed " " quoted-file))))))
         (my/run-in-external-terminal 'powershell final-cmd)))))
 
 (defun my/run-agy-cmd-on-current-file (args)
@@ -2488,7 +2537,7 @@ wt.exe があれば Windows Terminal で、なければ標準のコンソール�
   [r] ローマ字検索 (consult-line-migemo)            [F] ファイル操作 (hydra-file)
   [O] 一括編集 (moccur)                             [S] Consult 探索メニュー (hydra-consult)
   [n] 新しいウィンドウ (make-frame)                 [d] 辞書 (lookup)
-  [c] cmd.exe (conpty)                              [P] PowerShell (conpty-powershell)
+  [c] cmd.exe (ghostel)                             [P] PowerShell (ghostel)
   [E] EPUBリーダー (nov.el)                         [C] 電卓メニュー (calc)
   [T] テキスト変換 (hydra-text)                     [W] 週間天気予報 (my/weather)
   [H] howmメモ (my/howm-toggle)                     [A] AI & Antigravity (hydra-ai)
@@ -2513,8 +2562,8 @@ wt.exe があれば Windows Terminal で、なければ標準のコンソール�
   ("A" hydra-ai/body)
   ("a" hydra-ai/body)
   ("M" hydra-marker/body)
-  ("c" conpty)
-  ("P" conpty-powershell)
+  ("c" my/ghostel-cmd)
+  ("P" ghostel)
   ("L" my/open-calendar)
   ("W" my/weather)
   ("H" my/howm-toggle)
@@ -2545,8 +2594,8 @@ wt.exe があれば Windows Terminal で、なければ標準のコンソール�
     (define-key menu-map [hydra-file]       '(menu-item "ファイル操作" hydra-file/body :keys "M-o F"))
     (define-key menu-map [hydra-window]     '(menu-item "ウィンドウ操作" hydra-window/body :keys "M-o w"))
     (define-key menu-map [separator-2b]     '(menu-item "--"))
-    (define-key menu-map [hydra-conpty-cmd] '(menu-item "cmd.exe (conpty)" conpty :keys "M-o c"))
-    (define-key menu-map [hydra-conpty-ps]  '(menu-item "PowerShell (conpty)" conpty-powershell :keys "M-o P"))
+    (define-key menu-map [hydra-conpty-cmd] '(menu-item "cmd.exe (ghostel)" my/ghostel-cmd :keys "M-o c"))
+    (define-key menu-map [hydra-conpty-ps]  '(menu-item "PowerShell (ghostel)" ghostel :keys "M-o P"))
     (define-key menu-map [separator-3]      '(menu-item "--"))
     (define-key menu-map [hydra-obsidian]   '(menu-item "Obsidian メニュー" hydra-obsidian/body :keys "M-o o"))
     (define-key menu-map [hydra-markdown]   '(menu-item "Markdown メニュー" hydra-markdown/body :keys "M-o m"))
@@ -6200,6 +6249,7 @@ M-0〜M-9を前置した場合はそのレジスタへコピーする（削除�
           (text-mode . insert)
           (conpty-mode . insert)
           (term-mode . insert)
+          (ghostel-mode . insert)
           (auximap-mode . motion)
           (auximap-view-mode . motion)))
 
@@ -6248,17 +6298,24 @@ M-0〜M-9を前置した場合はそのレジスタへコピーする（削除�
   (puni-global-mode)
 
   ;; --- INSERT state: Backspaceを構造を壊さない削除に差し替え ---
-  ;; conpty / term-mode 等の端末バッファでは、バッファ直接編集ではなく
-  ;; 端末プロセスへ Backspace (\C-?) を送信する必要があるため切り分ける。
+  ;; conpty / term-mode / ghostel-mode 等の端末バッファでは、バッファ直接編集ではなく
+  ;; 端末プロセスへ Backspace を送信する必要があるため切り分ける。
   (defun my/meow-backward-delete-char ()
-    "conpty/term等の端末バッファではプロセスへBackspaceを送信し、
+    "conpty/term/ghostel等の端末バッファではプロセスへBackspaceを送信し、
 通常バッファではpuniによる構造認識削除を行う。"
     (interactive)
-    (if (derived-mode-p 'conpty-mode 'term-mode)
-        (if (fboundp 'term-send-backspace)
-            (term-send-backspace)
-          (term-send-raw-string "\C-?"))
-      (puni-backward-delete-char)))
+    (cond
+     ((derived-mode-p 'ghostel-mode)
+      (if (fboundp 'ghostel--send-event)
+          (call-interactively #'ghostel--send-event)
+        (when (fboundp 'ghostel--send-string)
+          (ghostel--send-string "\C-?"))))
+     ((derived-mode-p 'conpty-mode 'term-mode)
+      (if (fboundp 'term-send-backspace)
+          (term-send-backspace)
+        (term-send-raw-string "\C-?")))
+     (t
+      (puni-backward-delete-char))))
 
   (with-eval-after-load 'meow
     (meow-define-keys 'insert
